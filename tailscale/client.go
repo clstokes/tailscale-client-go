@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/tailscale/hujson"
+
+	"golang.org/x/oauth2/clientcredentials"
 )
 
 type (
@@ -44,6 +46,25 @@ type (
 
 const baseURL = "https://api.tailscale.com"
 const contentType = "application/json"
+
+// NewClientFromOAuth returns a new instance of the Client type that will perform operations against a chosen tailnet using
+// OAuth Credentials. The Client will generate a new API key against the Tailscale OAuth token endpoint.
+// If the API key expires, it will not be automatically renewed by the Client.
+// Additional options can be provided, see ClientOption for more details.
+func NewClientFromOAuth(oauthClientID, oauthClientSecret, tailnet string, options ...ClientOption) (*Client, error) {
+	var oauthConfig = &clientcredentials.Config{
+		ClientID:     oauthClientID,
+		ClientSecret: oauthClientSecret,
+		TokenURL:     fmt.Sprintf("%s/api/v2/oauth/token", baseURL),
+	}
+
+	tokenResponse, err := oauthConfig.Token(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("error getting API key from OAuth token endpoint: %w", err)
+	}
+
+	return NewClient(tokenResponse.AccessToken, tailnet)
+}
 
 // NewClient returns a new instance of the Client type that will perform operations against a chosen tailnet and will
 // provide the apiKey for authorization. Additional options can be provided, see ClientOption for more details.
