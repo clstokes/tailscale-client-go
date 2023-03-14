@@ -57,7 +57,7 @@ const contentType = "application/json"
 // OAuth Credentials. The Client will generate a new API key against the Tailscale OAuth token endpoint. The API key will be
 // renewed based on the `expires_in` property returned from the Tailscale OAuth token endpoint.
 // Additional options can be provided, see ClientOption for more details.
-func NewClientFromOAuth(ctx context.Context, oauthClientID, oauthClientSecret string, tailnet string, options ...ClientOption) (*Client, error) {
+func NewClientFromOAuth(ctx context.Context, oauthClientID, oauthClientSecret string, oauthScopes []string, tailnet string, options ...ClientOption) (*Client, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
@@ -67,6 +67,7 @@ func NewClientFromOAuth(ctx context.Context, oauthClientID, oauthClientSecret st
 		ClientID:     oauthClientID,
 		ClientSecret: oauthClientSecret,
 		TokenURL:     fmt.Sprintf("%s/api/v2/oauth/token", baseURL),
+		Scopes:       oauthScopes,
 	}
 
 	c := &Client{
