@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sync"
 	"time"
 
 	"github.com/tailscale/hujson"
@@ -23,11 +22,7 @@ import (
 type (
 	// The Client type is used to perform actions against the Tailscale API.
 	Client struct {
-		oauthConfig     *clientcredentials.Config
-		oauthToken      *oauth2.Token
-		oauthTokenMutex sync.Mutex // for locking oauthToken during updates
-
-		apiKey  string
+		apiKey  string // TODO: Remove once NewClient(apiKey, ...) has been removed in favor of NewClientContext().
 		http    *http.Client
 		baseURL *url.URL
 		tailnet string
@@ -52,45 +47,7 @@ type (
 
 const baseURL = "https://api.tailscale.com"
 const contentType = "application/json"
-
-// NewClientFromOAuth returns a new instance of the Client type that will perform operations against a chosen tailnet using
-// OAuth Credentials. The Client will generate a new API key against the Tailscale OAuth token endpoint. The API key will be
-// renewed based on the `expires_in` property returned from the Tailscale OAuth token endpoint.
-// Additional options can be provided, see ClientOption for more details.
-func NewClientFromOAuth(ctx context.Context, oauthClientID, oauthClientSecret string, oauthScopes []string, tailnet string, options ...ClientOption) (*Client, error) {
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		return nil, err
-	}
-
-	var oauthConfig = &clientcredentials.Config{
-		ClientID:     oauthClientID,
-		ClientSecret: oauthClientSecret,
-		TokenURL:     fmt.Sprintf("%s/api/v2/oauth/token", baseURL),
-		Scopes:       oauthScopes,
-	}
-
-	c := &Client{
-		oauthConfig: oauthConfig,
-		http:        httpClientWithDefaults(),
-		baseURL:     u,
-		tailnet:     tailnet,
-	}
-
-	// return an error message at client initialization if oauth credentials fail instead of waiting for first request
-	_, err = c.apiKeyFromOAuth(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("error getting API key from OAuth token endpoint: %w", err)
-	}
-
-	for _, option := range options {
-		if err = option(c); err != nil {
-			return nil, err
-		}
-	}
-
-	return c, nil
-}
+const defaultHttpClientTimeout = time.Minute
 
 // NewClient returns a new instance of the Client type that will perform operations against a chosen tailnet and will
 // provide the apiKey for authorization. Additional options can be provided, see ClientOption for more details.
@@ -102,7 +59,7 @@ func NewClient(apiKey, tailnet string, options ...ClientOption) (*Client, error)
 
 	c := &Client{
 		apiKey:  apiKey,
-		http:    httpClientWithDefaults(),
+		http:    &http.Client{Timeout: defaultHttpClientTimeout},
 		baseURL: u,
 		tailnet: tailnet,
 	}
@@ -116,26 +73,33 @@ func NewClient(apiKey, tailnet string, options ...ClientOption) (*Client, error)
 	return c, nil
 }
 
-func httpClientWithDefaults() *http.Client {
-	return &http.Client{Timeout: time.Minute}
-}
-
-// apiKeyFromOAuth returns the current API key if it's still valid else will retrieve
-// a new API key using the original clientcredentials.Config on the client,
-// setting the new Token on the client and returning the new API key
-func (c *Client) apiKeyFromOAuth(ctx context.Context) (string, error) {
-	c.oauthTokenMutex.Lock()
-	defer c.oauthTokenMutex.Unlock()
-
-	if c.oauthToken == nil || !c.oauthToken.Valid() {
-		tok, err := c.oauthConfig.Token(ctx)
-		if err != nil {
-			return "", fmt.Errorf("error getting API key from OAuth token endpoint: %w", err)
-		}
-		c.oauthToken = tok
+// NewClientContext returns a new instance of the Client type that will perform operations against a chosen tailnet.
+// One of WithAPIKey(...) or WithOAuthClientCredentials(...) must be provided to provide authentication details.
+// Additional options can be provided, see ClientOption for more details.
+func NewClientContext(options ...ClientOption) (*Client, error) {
+	defaultTailnet := "-" // the tailnet of the auth token is used
+	defaultBaseURL, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, err
 	}
 
-	return c.oauthToken.AccessToken, nil
+	c := &Client{
+		baseURL: defaultBaseURL,
+		tailnet: defaultTailnet,
+	}
+
+	for _, option := range options {
+		if err := option(c); err != nil {
+			return nil, err
+		}
+	}
+
+	// WithAPIKey or WithOAuthClientCredentials will initialize the http client. Fail here if it is still unset.
+	if c.http == nil {
+		return nil, errors.New("no authentication credentials provided")
+	}
+
+	return c, nil
 }
 
 // WithBaseURL sets a custom baseURL for the Tailscale API, this is primarily used for testing purposes.
@@ -147,6 +111,48 @@ func WithBaseURL(baseURL string) ClientOption {
 		}
 
 		c.baseURL = u
+		return nil
+	}
+}
+
+// WithTailnet sets the tailnet for all operations for the Tailscale API.
+// If not set, the tailnet of the auth token is used.
+func WithTailnet(tailnet string) ClientOption {
+	return func(c *Client) error {
+		c.tailnet = tailnet
+		return nil
+	}
+}
+
+// WithAPIKey sets the API key to use for the Tailscale API.
+func WithAPIKey(ctx context.Context, apiKey string) ClientOption {
+	return func(c *Client) error {
+		ts := oauth2.StaticTokenSource(
+			&oauth2.Token{AccessToken: apiKey},
+		)
+		c.http = oauth2.NewClient(ctx, ts)
+		c.http.Timeout = defaultHttpClientTimeout
+		return nil
+	}
+}
+
+// WithOAuthClientCredentials sets the OAuth Client Credentials to use for the Tailscale API.
+func WithOAuthClientCredentials(ctx context.Context, clientID, clientSecret string, scopes []string) ClientOption {
+	return func(c *Client) error {
+		relTokenURL, err := url.Parse("/api/v2/oauth/token")
+		if err != nil {
+			return err
+		}
+		oauthConfig := clientcredentials.Config{
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			TokenURL:     c.baseURL.ResolveReference(relTokenURL).String(),
+			Scopes:       scopes,
+		}
+
+		// c.http = config.Client(context.Background()) // THIS WORKS when terraform runs with
+		c.http = oauthConfig.Client(ctx) // THIS FAILS when terraform runs with │ Get "https://api.tailscale.com/api/v2/tailnet/-/devices": Post "https://api.tailscale.com/api/v2/oauth/token": context canceled
+		c.http.Timeout = defaultHttpClientTimeout
 		return nil
 	}
 }
@@ -182,13 +188,9 @@ func (c *Client) buildRequest(ctx context.Context, method, uri string, headers m
 		req.Header.Set("Content-Type", contentType)
 	}
 
-	if c.oauthConfig != nil {
-		apiKey, err := c.apiKeyFromOAuth(ctx)
-		if err != nil {
-			return nil, err
-		}
-		req.SetBasicAuth(apiKey, "")
-	} else {
+	// TODO: Remove once NewClient(apiKey, ...) has been removed in favor of NewClientContext().
+	// c.apiKey will not be set on the client if WithAPIKey(...) was used to provide the key.
+	if c.apiKey != "" {
 		req.SetBasicAuth(c.apiKey, "")
 	}
 
